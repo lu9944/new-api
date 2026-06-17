@@ -1,0 +1,298 @@
+name: Build & Release Offline Docker Image
+
+# Builds a fully self-contained Docker image (frontend embedded in the Go
+# binary, static runtime) using the project's multi-stage Dockerfile, then
+# exports it as a compressed tarball and publishes everything to a GitHub
+# Release so it can be deployed on machines with NO internet access.
+#
+# Offline usage on the target machine:
+#   docker load -i new-api-<version>-<arch>.tar.gz
+#   docker compose up -d        # uses the docker-compose.yml shipped below
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version/tag to build (e.g. v0.10.8). Empty = auto from git tag or a dev stamp.'
+        required: false
+        type: string
+      architectures:
+        description: 'Architectures to build'
+        required: true
+        type: choice
+        default: 'all'
+        options:
+          - all
+          - amd64
+          - arm64
+      make_latest:
+        description: 'Mark the release as "latest"'
+        required: true
+        type: boolean
+        default: false
+  push:
+    tags:
+      - '*'
+      - '!nightly*'
+      - '!*-alpha*'
+
+jobs:
+  build:
+    name: Build offline image (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Decide whether to build this architecture
+        id: gate
+        run: |
+          SELECTED="${{ github.event.inputs.architectures || 'all' }}"
+          if [ "$SELECTED" = "all" ] || [ "$SELECTED" = "${{ matrix.arch }}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping ${{ matrix.arch }} build (selected: $SELECTED)"
+          fi
+
+      - name: Check out
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version & write VERSION file
+        if: steps.gate.outputs.run == 'true'
+        id: version
+        run: |
+          INPUT_VER="${{ github.event.inputs.version }}"
+          if [ -n "$INPUT_VER" ]; then
+            VERSION="$INPUT_VER"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="dev-$(date -u +%Y%m%d)-$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          fi
+          # strip a leading 'v' for the image tag but keep the original for the release
+          echo "$VERSION" > VERSION
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building offline image for version: $VERSION (${{ matrix.arch }})"
+
+      - name: Set up Docker Buildx
+        if: steps.gate.outputs.run == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load locally, do NOT push)
+        if: steps.gate.outputs.run == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          tags: new-api:${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Save image as compressed tar
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          IMAGE="new-api:${{ steps.version.outputs.version }}"
+          FILE="new-api-${{ steps.version.outputs.version }}-${{ matrix.arch }}.tar.gz"
+          echo "Exporting $IMAGE -> $FILE"
+          docker image inspect "$IMAGE" --format 'Image size: {{.Size}} bytes'
+          docker save "$IMAGE" | gzip -9 > "$FILE"
+          echo "FILE=$FILE" >> "$GITHUB_ENV"
+          ls -lh "$FILE"
+
+      - name: Generate SHA-256 checksum
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          sha256sum "$FILE" > "$FILE.sha256"
+          echo "Checksum:" && cat "$FILE.sha256"
+
+      - name: Upload build artifact
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-api-image-${{ matrix.arch }}
+          path: |
+            ${{ env.FILE }}
+            ${{ env.FILE }}.sha256
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    name: Publish to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+
+    steps:
+      - name: Download all image artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: new-api-image-*
+          merge-multiple: true
+
+      - name: Resolve version
+        id: meta
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # tag_name must be a git ref; prefix with 'offline-' when it is a dev stamp
+          if [[ "$VERSION" == dev-* ]]; then
+            echo "tag_name=offline-${VERSION}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_name=${VERSION}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate combined checksums
+        working-directory: release-assets
+        run: |
+          cat *.sha256 > checksums.txt
+          echo "=== Release assets ===" && ls -lh
+
+      - name: Generate offline docker-compose.yml
+        working-directory: release-assets
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          cat > docker-compose.yml <<'YAML'
+          services:
+            new-api:
+              image: new-api:__VERSION__
+              container_name: new-api
+              restart: always
+              command: --log-dir /app/logs
+              ports:
+                - "3000:3000"
+              environment:
+                TZ: Asia/Shanghai
+                ERROR_LOG_ENABLED: "true"
+                BATCH_UPDATE_ENABLED: "true"
+              volumes:
+                - ./data:/data
+                - ./logs:/app/logs
+              healthcheck:
+                test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/status | grep -q '\"success\":\\s*true'"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+          YAML
+          sed -i "s/__VERSION__/${VERSION}/g" docker-compose.yml
+
+      - name: Generate offline deployment guide
+        working-directory: release-assets
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          cat > OFFLINE-DEPLOY.md <<'MD'
+          # Offline Deployment Guide — new-api __VERSION__
+
+          This release contains a fully self-contained Docker image of new-api.
+          No internet connection is required at runtime.
+
+          ## 1. Load the image
+
+          Choose the file matching your CPU architecture:
+
+          | File | Architecture |
+          |------|-------------|
+          | `new-api-__VERSION__-amd64.tar.gz` | x86_64 (most servers / PCs) |
+          | `new-api-__VERSION__-arm64.tar.gz` | ARM 64 (Raspberry Pi 4/5, AWS Graviton, etc.) |
+
+          ```bash
+          docker load -i new-api-__VERSION__-amd64.tar.gz
+          # -> Loaded image: new-api:__VERSION__
+          ```
+
+          Verify:
+
+          ```bash
+          docker images new-api
+          ```
+
+          ## 2. (Optional) Verify integrity
+
+          ```bash
+          sha256sum -c new-api-__VERSION__-amd64.tar.gz.sha256
+          ```
+
+          ## 3. Run with docker-compose
+
+          A ready-to-use `docker-compose.yml` is included in this release.
+
+          ```bash
+          docker compose up -d
+          docker compose logs -f
+          ```
+
+          The web UI is available at **http://<server-ip>:3000**.
+          Data is persisted under `./data` and logs under `./logs`.
+
+          ## 4. Run with plain docker
+
+          ```bash
+          mkdir -p data logs
+          docker run -d --name new-api \
+            -p 3000:3000 \
+            -v "$PWD/data:/data" \
+            -v "$PWD/logs:/app/logs" \
+            -e TZ=Asia/Shanghai \
+            new-api:__VERSION__
+          ```
+
+          ## Notes
+
+          - The image uses **SQLite by default** (stored in `/data`), so no external
+            database is needed for a single-node offline deployment.
+          - To use **MySQL/PostgreSQL** or **Redis**, provide them on the same host or
+            LAN and set `SQL_DSN` / `REDIS_CONN_STRING`.
+          - Default admin credentials: `root` / `123456` — **change them immediately**.
+          MD
+          sed -i "s/__VERSION__/${VERSION}/g" OFFLINE-DEPLOY.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag_name }}
+          name: new-api ${{ steps.meta.outputs.version }} (Offline Docker Image)
+          body: |
+            ## Offline Docker Image — `${{ steps.meta.outputs.version }}`
+
+            Self-contained image: the React frontend is compiled into the Go binary,
+            and the runtime is a slim Debian image with no runtime downloads.
+
+            See **OFFLINE-DEPLOY.md** for step-by-step instructions.
+
+            ```bash
+            docker load -i new-api-${{ steps.meta.outputs.version }}-amd64.tar.gz
+            docker compose up -d
+            ```
+          files: |
+            release-assets/*.tar.gz
+            release-assets/*.sha256
+            release-assets/checksums.txt
+            release-assets/docker-compose.yml
+            release-assets/OFFLINE-DEPLOY.md
+          draft: false
+          prerelease: false
+          make_latest: ${{ github.event.inputs.make_latest || false }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
